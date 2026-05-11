@@ -1,0 +1,326 @@
+trigger:
+  branches:
+    include:
+    - develop
+
+stages:
+# ====================== DEV STAGE =========================
+- stage: Dev
+  displayName: 'Dev Build & Deploy'
+  variables:
+    - template: Variables/variables-dev.yml
+
+  jobs:
+    - job: BuildAndScan
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        # Clones source code to the agent
+        - checkout: self
+
+        # Sets Python 3.12 as the active runtime
+        - task: UsePythonVersion@0
+          displayName: Use Python
+          inputs:
+            versionSpec: '3.12'  
+            addToPath: true
+            architecture: 'x64'
+
+        # Scans source code for security flaws (SAST)
+        - task: SnykSecurityScan@1
+          displayName: Snyk Code Scan
+          inputs:
+            serviceConnectionEndpoint: 'Snyk-SC'
+            testType: 'code'
+            failOnIssues: true
+            projectName: 'EVA-Everywhere-KM-Agent'
+            additionalArguments: '--report --target-reference="$(Build.SourceBranchName)"'
+          env:
+            SNYK_API: "https://api.us.snyk.io"
+          continueOnError: true
+          
+        # Installs local libs for Snyk dependency mapping
+        - bash: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt || true
+          workingDirectory: $(System.DefaultWorkingDirectory)
+          displayName: 'Install Python dependencies for Snyk'
+          continueOnError: false
+        
+        # Scans third-party libraries for vulnerabilities (SCA)
+        - task: SnykSecurityScan@1
+          displayName: Snyk App Scan
+          inputs:
+            serviceConnectionEndpoint: 'Snyk-SC'
+            testType: 'app'
+            monitorWhen: 'always'
+            failOnIssues: true
+            additionalArguments: '--severity-threshold=high --all-projects --target-reference="$(Build.SourceBranchName)"'
+          env:
+            SNYK_API: "https://api.us.snyk.io"
+          continueOnError: true
+
+        # Creates Docker image and uploads to Dev ACR
+        - task: Docker@2
+          displayName: 'Build and Push Docker image to ACR Dev'
+          inputs:
+            containerRegistry: 'CDS-NONP-->kmcontainerregistry1-SC'
+            repository: $(imageName)
+            command: buildAndPush
+            Dockerfile: '**/Dockerfile'
+            tags: $(dockerTag)
+
+    - deployment: DeployDev
+      displayName: 'Deploying container app to Dev'
+      dependsOn: BuildAndScan
+      environment: CA-KM-DEV
+      pool:
+        vmImage: ubuntu-latest
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              # Downloads Dev environment secret variables
+              - task: AzureKeyVault@2
+                inputs:
+                  azureSubscription: 'CDS-NONP-->DIG-EVA_EVERYWHERE_KMGT-001-D-SC'
+                  KeyVaultName: $(keyVaultName)
+                  SecretsFilter: '*'
+                  RunAsPreJob: true
+
+              # Fetches shared Wiz scan credentials
+              - task: AzureKeyVault@2
+                displayName: 'Get WIZ Secrets'
+                inputs:
+                  azureSubscription: 'ITS-PROD-->kv-vc-api-evaeverywhere-SC'
+                  KeyVaultName: 'kv-vc-api-evaeverywhere'
+                  SecretsFilter: '*'
+                  RunAsPreJob: true
+
+              # Authenticates agent to the Dev registry
+              - task: Docker@2
+                displayName: 'Login to DEV ACR'
+                inputs:
+                  containerRegistry: 'CDS-NONP-->kmcontainerregistry1-SC'
+                  command: 'login'
+                  addPipelineData: false
+                  addBaseImageData: false
+
+              # Downloads image locally for security inspection
+              - bash: |
+                  FULL_IMAGE_NAME="$(acrLoginServer)/$(imageName):$(dockerTag)"
+                  echo "Pulling image: ${FULL_IMAGE_NAME}"
+                  docker pull "${FULL_IMAGE_NAME}"
+                displayName: 'Pull image from DEV ACR'
+                continueOnError: false
+
+              # Scans image for policy violations using Wiz
+              - task: wiz@0
+                displayName: 'Wiz Container Image Scan - DEV'
+                inputs:
+                  command: 'image'
+                  clientid: '$(WIZ-CLIENT-ID)'
+                  secret: '$(WIZ-CLIENT-SECRET)'
+                  image: '$(acrLoginServer)/$(imageName):$(dockerTag)'
+                  policyHitsOnly: true
+                  fileHashesScan: true
+                  scanPolicies: 'EVA Everywhere-Conatiner-Policy'  
+                continueOnError: true
+
+              # Updates the Dev Container App with the new image
+              - task: AzureCLI@2
+                inputs:
+                  azureSubscription: 'CDS-NONP-->DIG-EVA_EVERYWHERE_KMGT-001-D-SC'
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    az containerapp update \
+                      --name $(containerAppName) \
+                      --resource-group $(resourceGroup) \
+                      --image $(acrLoginServer)/$(imageName):$(dockerTag) \
+                      --set-env-vars vault_url=$(vaultUrl)
+
+# ====================== SIT STAGE ======================
+- stage: SIT
+  displayName: 'SIT Build & Deploy'
+  dependsOn: Dev
+  variables:
+    - template: Variables/variables-sit.yml
+  jobs:
+    # Build for SIT
+    - job: BuildSIT
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        - checkout: self
+
+        - task: Docker@2
+          displayName: 'Build and Push Docker image to ACR SIT'
+          inputs:
+            containerRegistry: 'CDS-NONP-->crkmagentsit01-SC'
+            repository: $(imageName)
+            command: buildAndPush
+            Dockerfile: '**/Dockerfile'
+            tags: $(dockerTag)
+
+    # Deploy to SIT
+    - deployment: DeploySIT
+      displayName: 'Deploying container app to SIT'
+      dependsOn: BuildSIT
+      environment: CA-KM-SIT
+      pool:
+        vmImage: ubuntu-latest
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              - task: AzureKeyVault@2
+                inputs:
+                  azureSubscription: 'CDS-NONP-->DIG-EVA_EVERYWHERE_KMGT-001-S-SC'
+                  KeyVaultName: $(keyVaultName)
+                  SecretsFilter: '*'
+                  RunAsPreJob: true
+
+               # Fetches shared Wiz scan credentials
+              - task: AzureKeyVault@2
+                displayName: 'Get WIZ Secrets'
+                inputs:
+                  azureSubscription: 'ITS-PROD-->kv-vc-api-evaeverywhere-SC'
+                  KeyVaultName: 'kv-vc-api-evaeverywhere'
+                  SecretsFilter: '*'
+                  RunAsPreJob: true
+
+             # Authenticates agent to the Dev registry
+              - task: Docker@2
+                displayName: 'Login to SIT ACR'
+                inputs:
+                  containerRegistry: 'CDS-NONP-->crkmagentsit01-SC'
+                  command: 'login'
+                  addPipelineData: false
+                  addBaseImageData: false
+
+              - bash: |
+                  FULL_IMAGE_NAME="$(acrLoginServer)/$(imageName):$(dockerTag)"
+                  echo "Pulling image: ${FULL_IMAGE_NAME}"
+                  docker pull "${FULL_IMAGE_NAME}"
+                displayName: 'Pull image from SIT ACR'
+                continueOnError: false
+
+              # Scans image for policy violations using Wiz
+              - task: wiz@0
+                displayName: 'Wiz Container Image Scan - SIT'
+                inputs:
+                  command: 'image'
+                  clientid: '$(WIZ-CLIENT-ID)'
+                  secret: '$(WIZ-CLIENT-SECRET)'
+                  image: '$(acrLoginServer)/$(imageName):$(dockerTag)'
+                  policyHitsOnly: true
+                  fileHashesScan: true
+                  scanPolicies: 'EVA Everywhere-Conatiner-Policy'  
+                continueOnError: true
+
+              - task: AzureCLI@2
+                inputs:
+                  azureSubscription: 'CDS-NONP-->DIG-EVA_EVERYWHERE_KMGT-001-S-SC'
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    az containerapp update \
+                      --name $(containerAppName) \
+                      --resource-group $(resourceGroup) \
+                      --image $(acrLoginServer)/$(imageName):$(dockerTag) \
+                      --set-env-vars vault_url=$(vaultUrl)
+
+# ====================== PROD STAGE ======================
+- stage: Prod
+  displayName: 'Prod Build & Deploy'
+  dependsOn: SIT
+  variables:
+    - template: Variables/variables-prod.yml
+  jobs:
+    - job: BuildProd
+      pool:
+        vmImage: ubuntu-latest
+      steps:
+        # Final source checkout for Prod build
+        - checkout: self
+
+        # Builds and pushes image to Prod registry
+        - task: Docker@2
+          displayName: 'Build and Push Docker image to ACR Prod'
+          inputs:
+            containerRegistry: 'CDS-PROD-->crkmagentprod01-SC'
+            repository: $(imageName)
+            command: buildAndPush
+            Dockerfile: '**/Dockerfile'
+            tags: $(dockerTag)
+
+    - deployment: DeployProd
+      displayName: 'Deploying container app to Prod'
+      dependsOn: BuildProd
+      environment: CA-KM-PROD
+      pool:
+        vmImage: ubuntu-latest
+      strategy:
+        runOnce:
+          deploy:
+            steps:
+              # Downloads sensitive production secrets
+              - task: AzureKeyVault@2
+                inputs:
+                  azureSubscription: 'CDS-PROD-->DIG-EVA_EVERYWHERE_KMGT-001-P-SC'
+                  KeyVaultName: $(keyVaultName)
+                  SecretsFilter: '*'
+                  RunAsPreJob: true
+
+              # Retrieves Wiz credentials for Prod scan
+              - task: AzureKeyVault@2
+                displayName: 'Get WIZ Secrets'
+                inputs:
+                  azureSubscription: 'ITS-PROD-->kv-vc-api-evaeverywhere-SC'
+                  KeyVaultName: 'kv-vc-api-evaeverywhere'
+                  SecretsFilter: '*'
+                  RunAsPreJob: true
+
+              # Authenticates agent to the Prod registry
+              - task: Docker@2
+                displayName: 'Login to PROD ACR'
+                inputs:
+                  containerRegistry: 'CDS-PROD-->crkmagentprod01-SC'
+                  command: 'login'
+                  addPipelineData: false
+                  addBaseImageData: false
+
+              # Pre-pulls image to agent for final Prod scanning
+              - bash: |
+                  FULL_IMAGE_NAME="$(acrLoginServer)/$(imageName):$(dockerTag)"
+                  echo "Pulling image: ${FULL_IMAGE_NAME}"
+                  docker pull "${FULL_IMAGE_NAME}"
+                displayName: 'Pull image from PROD ACR'
+                continueOnError: false
+
+              # Final security scan before production release
+              - task: wiz@0
+                displayName: 'Wiz Container Image Scan - PROD'
+                inputs:
+                  command: 'image'
+                  clientid: '$(WIZ-CLIENT-ID)'
+                  secret: '$(WIZ-CLIENT-SECRET)'
+                  image: '$(acrLoginServer)/$(imageName):$(dockerTag)'
+                  policyHitsOnly: true
+                  fileHashesScan: true
+                  scanPolicies: 'EVA Everywhere-Conatiner-Policy'  
+                continueOnError: true
+
+              # Switches the live Prod app to the new image
+              - task: AzureCLI@2
+                inputs:
+                  azureSubscription: 'CDS-PROD-->DIG-EVA_EVERYWHERE_KMGT-001-P-SC'
+                  scriptType: bash
+                  scriptLocation: inlineScript
+                  inlineScript: |
+                    az containerapp update \
+                      --name $(containerAppName) \
+                      --resource-group $(resourceGroup) \
+                      --image $(acrLoginServer)/$(imageName):$(dockerTag) \
+                      --set-env-vars vault_url=$(vaultUrl)
